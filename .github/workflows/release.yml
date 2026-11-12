@@ -247,16 +247,17 @@ jobs:
 
           cd release-assets && sha256sum ./*.apk ./*.aab > SHA256SUMS
 
-      # Ensure tag exists locally and publish/update the release on GitHub
+      # Ensure tag exists locally and publish/update the release on YOUR GitHub repository
       - name: Publish the release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="${{ steps.version.outputs.tag }}"
 
-          # Create local git tag and push it if missing
+          # Create local git tag and push it to YOUR repo if missing
           if ! git rev-parse "$tag" >/dev/null 2>&1; then
             git tag "$tag"
             git push origin "$tag" || true
@@ -267,12 +268,13 @@ jobs:
             quiet="--prerelease --latest=false"
           fi
 
-          if gh release view "$tag" >/dev/null 2>&1; then
+          # Target your repository explicitly using -R / --repo
+          if gh release view "$tag" -R "$GH_REPO" >/dev/null 2>&1; then
             if [[ -n "$quiet" ]]; then
-              gh release edit "$tag" $quiet
+              gh release edit "$tag" -R "$GH_REPO" $quiet
             fi
-            gh release upload "$tag" release-assets/* --clobber
+            gh release upload "$tag" release-assets/* -R "$GH_REPO" --clobber
           else
             gh release create "$tag" release-assets/* \
-              --generate-notes --title "WhiteAestherMobile $tag" $quiet
+              -R "$GH_REPO" --generate-notes --title "WhiteAestherMobile $tag" $quiet
           fi
