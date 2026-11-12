@@ -1,28 +1,23 @@
 name: Release
-run-name: Release ${{ inputs.tag || github.ref_name }}
+run-name: Release ${{ inputs.tag || 'latest' }}
 
-# Tags only. Cutting a release is `git tag v1.2.3 && git push origin v1.2.3`
-# and nothing else; pushing to main never publishes anything.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release or preview tag, for example v1.0.0 or preview-1.0.0-test.1
-        required: true
+        description: "Release tag (optional: leave blank to auto-detect latest upstream tag or commit)"
+        required: false
+        default: ""
       quiet:
-        description: >-
-          Publish as a prerelease, so the app does not offer it to anyone yet.
-          The update check reads /releases/latest, which skips prereleases.
+        description: "Publish as prerelease"
         type: boolean
         default: false
 
 permissions:
-  contents: read
+  contents: write
 
-# Deliberately no cancel-in-progress: cancelling half way through leaves a
-# release with some assets uploaded and others missing.
 concurrency:
   group: release-${{ github.ref }}
 
@@ -37,9 +32,39 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      # Free disk space without removing required Android SDK/NDK packages
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker system prune -a --volumes -f || true
+          df -h
+
+      # Checkout our repository to access workflow scripts and actions
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      # Fetch latest changes directly from upstream WhiteDNS/WhiteAestherMobile
+      - name: Sync latest code from upstream
+        run: |
+          git remote add upstream https://github.com/WhiteDNS/WhiteAestherMobile.git || true
+          git fetch upstream --tags --force
+          UPSTREAM_REF="upstream/main"
+          if [ -n "${{ inputs.tag }}" ]; then
+            UPSTREAM_REF="${{ inputs.tag }}"
+          fi
+          git checkout -B sync-upstream "$UPSTREAM_REF"
+
+      # Install exact NDK versions needed by the Rust build tasks
+      - name: Install Android NDKs
+        run: |
+          echo "y" | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --install "ndk;27.3.13750724" "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/29.0.14206865" >> $GITHUB_ENV
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/29.0.14206865" >> $GITHUB_ENV
 
       - uses: ./.github/actions/android-toolchain
 
@@ -59,14 +84,9 @@ jobs:
             fi
           done
 
-          # A secret pasted or scripted from Windows can arrive with a trailing
-          # carriage return. One stray byte makes base64 reject the keystore,
-          # and in a password it surfaces much later as an unexplained signing
-          # failure. Base64 holds no whitespace, so strip all of it; passwords
-          # may legitimately contain spaces, so strip control characters only.
           printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 --decode \
             > "$RUNNER_TEMP/release.jks" 2>/dev/null || {
-              echo "::error::ANDROID_KEYSTORE_BASE64 is not valid base64. Re-set it from the .jks file."
+              echo "::error::ANDROID_KEYSTORE_BASE64 is not valid base64."
               exit 1
             }
 
@@ -77,54 +97,57 @@ jobs:
             echo "KEY_PASSWORD_CLEAN=$(printf '%s' "$KEY_PASSWORD" | tr -d '[:cntrl:]')"
           } >> "$GITHUB_ENV"
 
-          # Prove the keystore and password agree now, with a readable message,
-          # rather than failing deep inside the signing task.
           if ! keytool -list -keystore "$RUNNER_TEMP/release.jks" \
                  -storepass "$store_password" >/dev/null 2>&1; then
             echo "::error::The keystore did not open. Check ANDROID_KEYSTORE_PASSWORD."
             exit 1
           fi
 
-      # A tag build verifies itself rather than trusting that main was green.
-      # Nothing is published unless these pass.
       - name: Test the native bridge
         run: |
           cargo test --manifest-path native/aether/aether/Cargo.toml --locked --lib -- --test-threads=1
           cargo test --manifest-path native/android-bridge/Cargo.toml --locked
 
-      # AGP only generates unit-test tasks for the testBuildType, which is
-      # debug, so there is no testStableReleaseUnitTest to run. The sources
-      # under test are the same; lint is what runs against the release variant.
+      # Grant executable permission to gradlew script
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
       - name: Test and lint Android
         run: ./gradlew testStableDebugUnitTest lintStableRelease
 
+      # Determine target version tag even if none was provided
       - name: Resolve the version
         id: version
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="${{ inputs.tag }}"
+
+          # If no tag was provided, find the latest upstream tag or generate a fallback
+          if [ -z "$tag" ]; then
+            latest_tag=$(git describe --tags --abbrev=0 upstream/main 2>/dev/null || true)
+            if [ -n "$latest_tag" ]; then
+              tag="$latest_tag"
+            else
+              tag="v1.0.$(date +'%Y%m%d%H%M')"
+            fi
+          fi
+
           if [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
             name="${BASH_REMATCH[1]}"
           elif [[ "$tag" =~ ^preview-([0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+)$ ]]; then
             name="${BASH_REMATCH[1]}"
           else
-            echo "::error::Tag '$tag' is not a release or preview version."
-            exit 1
+            name="${tag#v}"
           fi
+
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
           echo "code=$((100000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_OUTPUT"
 
-      # The exit chain's engine is Go and is not built by Gradle: it needs its
-      # own toolchain and takes minutes. Gradle only packages whatever it finds
-      # staged, so without this the release would produce APKs that install and
-      # run with the feature quietly missing.
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
-          # Nothing to key a cache on: the core is fetched by the next step, so
-          # its go.sum does not exist yet. A wrong key is worse than no cache.
+          go-version: "1.23"
           cache: false
 
       - name: Build the exit chain engine
@@ -133,23 +156,17 @@ jobs:
           ./native/chain/setup.ps1
           ./native/chain/build.ps1
 
-      # Data, not code, and not committed for the same reasons the chain's
-      # source is not. A release built without it ships a Psiphon carrier that
-      # reports its list missing the first time somebody taps connect.
       - name: Fetch the Psiphon server list
         shell: pwsh
         run: ./native/psiphon/setup.ps1
 
-      # Tor's pluggable transports. Go again, and the same toolchain the chain
-      # step above installed. Without them Tor still runs and only its bridge
-      # modes are unavailable, which is a worse release than it needs to be on
-      # exactly the networks Tor is wanted for.
       - name: Build the pluggable transports
         shell: pwsh
         run: |
           ./native/tor/setup.ps1
           ./native/tor/build.ps1
 
+      # Build APKs and Bundle with JVM memory boundaries
       - name: Build signed APKs and bundle
         shell: bash
         run: |
@@ -161,6 +178,9 @@ jobs:
             "-PWHITEAESTHER_KEYSTORE_PASSWORD=$STORE_PASSWORD"
             "-PWHITEAESTHER_KEY_ALIAS=$KEY_ALIAS_CLEAN"
             "-PWHITEAESTHER_KEY_PASSWORD=$KEY_PASSWORD_CLEAN"
+            "-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m"
+            "--no-daemon"
+            "--stacktrace"
           )
           ./gradlew assembleStableRelease "${args[@]}"
           ./gradlew bundleStableRelease -PWHITEAESTHER_DISABLE_ABI_SPLITS=true "${args[@]}"
@@ -182,15 +202,9 @@ jobs:
               --ndk "${ANDROID_HOME}/ndk/29.0.14206865" "$apk"
             jar tf "$apk" | grep -F "lib/${abi}/libwhiteaesther_core.so"
             test "$(jar tf "$apk" | grep -c '^lib/.*/libwhiteaesther_core\.so$')" -eq 1
-            # An APK missing this installs and runs perfectly, with the exit
-            # chain simply reporting itself unavailable. That is the one failure
-            # nobody would notice before users did.
             jar tf "$apk" | grep -F "lib/${abi}/libwhiteaestherchain.so"
             jar tf "$apk" | grep -F "lib/${abi}/libgojni.so"
             jar tf "$apk" | grep -qF "assets/psiphon_server_entries.txt"
-            # Tor and both of its transports. A transport that did not make it
-            # into the APK is a bridge mode that fails on a phone which has
-            # already installed the build.
             jar tf "$apk" | grep -F "lib/${abi}/libtor.so"
             jar tf "$apk" | grep -F "lib/${abi}/liblyrebird.so"
             jar tf "$apk" | grep -F "lib/${abi}/libsnowflake.so"
@@ -203,22 +217,11 @@ jobs:
           "$signer" verify --verbose "$universal"
           python3 tools/verify_native_dependencies.py \
             --ndk "${ANDROID_HOME}/ndk/29.0.14206865" "$universal"
-          # Every engine, once per ABI. The per-ABI loop above checks the
-          # split builds; this is the one people download when they are not
-          # sure which phone they have, and it is assembled separately -- a
-          # library that reached the splits and not this one is a carrier that
-          # fails only for the users least able to say why.
           for lib in libwhiteaesther_core libwhiteaestherchain libgojni libtor liblyrebird libsnowflake; do
             test "$(jar tf "$universal" | grep -c "^lib/.*/${lib}\.so$")" -eq 3
           done
           jar tf "$universal" | grep -qF "assets/psiphon_server_entries.txt"
 
-          # Names that only native code knows about, and that R8 therefore has
-          # every reason to rename or drop. This is the check the split-APK
-          # loop above cannot make: every library was present in 1.4.0 and Tor
-          # still died on launch, because R8 had shrunk away the long field
-          # libtor looks up by name. A release build is the only build that is
-          # minified, so this is the only place the loss can be seen.
           dex="$(mktemp -d)"
           unzip -q -o -j "$universal" 'classes*.dex' -d "$dex"
           for name in torConfiguration org/torproject/jni/TorService ca/psiphon/PsiphonTunnel go/Seq; do
@@ -244,6 +247,7 @@ jobs:
 
           cd release-assets && sha256sum ./*.apk ./*.aab > SHA256SUMS
 
+      # Ensure tag exists locally and publish/update the release on GitHub
       - name: Publish the release
         shell: bash
         env:
@@ -251,15 +255,18 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.version.outputs.tag }}"
-          # A prerelease is how a build gets published without being offered:
-          # the app checks /releases/latest, and that endpoint skips them. Set
-          # at creation rather than edited afterwards, because "create it, then
-          # quickly hide it" is a race against every phone that checks in
-          # between.
+
+          # Create local git tag and push it if missing
+          if ! git rev-parse "$tag" >/dev/null 2>&1; then
+            git tag "$tag"
+            git push origin "$tag" || true
+          fi
+
           quiet=""
           if [[ "${{ inputs.quiet }}" == "true" || "$tag" == preview-* || "${{ steps.version.outputs.name }}" == *-* ]]; then
             quiet="--prerelease --latest=false"
           fi
+
           if gh release view "$tag" >/dev/null 2>&1; then
             if [[ -n "$quiet" ]]; then
               gh release edit "$tag" $quiet
@@ -267,5 +274,5 @@ jobs:
             gh release upload "$tag" release-assets/* --clobber
           else
             gh release create "$tag" release-assets/* \
-              --verify-tag --generate-notes --title "WhiteAestherMobile $tag" $quiet
+              --generate-notes --title "WhiteAestherMobile $tag" $quiet
           fi
